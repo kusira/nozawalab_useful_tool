@@ -1,4 +1,4 @@
-"""NPY/RAW/PNG画像の読み込みと画像処理パラメータをスライダーで調整するGUIアプリ。"""
+"""NPY/RAW/PNG/JPEG画像の読み込みと画像処理パラメータをスライダーで調整するGUIアプリ。"""
 
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ class ImageProcessingApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("NPY/RAW/PNG画像プレビュー・特徴点解析")
+        self.root.title("NPY/RAW/PNG/JPEG画像プレビュー・特徴点解析")
         self.root.minsize(1280, 820)
 
         self.source_array: np.ndarray | None = None
@@ -470,10 +470,11 @@ class ImageProcessingApp:
         path = filedialog.askopenfilename(
             title="画像ファイルを選択",
             filetypes=[
-                ("対応形式", "*.npy *.raw *.png"),
+                ("対応形式", "*.npy *.raw *.png *.jpg *.jpeg"),
                 ("NumPy配列", "*.npy"),
                 ("RAW画像", "*.raw"),
                 ("PNG画像", "*.png"),
+                ("JPEG画像", "*.jpg *.jpeg"),
                 ("すべてのファイル", "*.*"),
             ],
         )
@@ -490,8 +491,12 @@ class ImageProcessingApp:
                 self.current_file_type = "npy"
                 self.reload_button.config(state=tk.DISABLED)
             elif suffix == ".png":
-                array, image = self.load_png(file_path)
+                array, image = self.load_raster(file_path)
                 self.current_file_type = "png"
+                self.reload_button.config(state=tk.DISABLED)
+            elif suffix in (".jpg", ".jpeg"):
+                array, image = self.load_raster(file_path)
+                self.current_file_type = "jpeg"
                 self.reload_button.config(state=tk.DISABLED)
             else:
                 settings = self._ask_raw_settings(file_path)
@@ -560,10 +565,12 @@ class ImageProcessingApp:
         return np.load(path)
 
     @staticmethod
-    def load_png(path: Path) -> tuple[np.ndarray, Image.Image]:
+    def load_raster(path: Path) -> tuple[np.ndarray, Image.Image]:
         with Image.open(path) as img:
-            image = img.convert("RGB" if img.mode != "L" else "L")
+            image = img.convert("RGB" if img.mode not in ("L", "LA") else "L")
         return np.asarray(image), image
+
+    load_png = load_raster
 
     @staticmethod
     def _resolve_raw_dtype(dtype_name: str, endian: str) -> np.dtype:
