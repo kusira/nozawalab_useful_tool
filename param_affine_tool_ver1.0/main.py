@@ -27,6 +27,14 @@ from module.face_pipeline import (  # noqa: E402
     warp_face_fs_affine,
 )
 from module.fa_landmark_calculator import resolve_torch_device  # noqa: E402
+from module.file_tree import (  # noqa: E402
+    DirNode,
+    build_dir_node,
+    directory_has_images,
+    format_dir_number,
+    format_file_number,
+    is_supported_image,
+)
 
 RAW_DTYPE_OPTIONS = [
     ("uint8", np.uint8),
@@ -36,6 +44,26 @@ RAW_DTYPE_OPTIONS = [
     ("int32", np.int32),
     ("float32", np.float32),
     ("float64", np.float64),
+]
+
+# 表示名 → PIL Resampling
+RESIZE_METHODS: dict[str, Image.Resampling] = {
+    "NEAREST（最近傍）": Image.Resampling.NEAREST,
+    "BILINEAR（双線形）": Image.Resampling.BILINEAR,
+    "BICUBIC（双三次）": Image.Resampling.BICUBIC,
+    "LANCZOS（高品質）": Image.Resampling.LANCZOS,
+    "BOX（ボックス平均）": Image.Resampling.BOX,
+    "HAMMING（Hamming窓）": Image.Resampling.HAMMING,
+}
+DEFAULT_RESIZE_METHOD = "LANCZOS（高品質）"
+
+FILE_DIALOG_TYPES = [
+    ("対応形式", "*.npy *.raw *.png *.jpg *.jpeg"),
+    ("NumPy配列", "*.npy"),
+    ("RAW画像", "*.raw"),
+    ("PNG画像", "*.png"),
+    ("JPEG画像", "*.jpg *.jpeg"),
+    ("すべてのファイル", "*.*"),
 ]
 
 
@@ -198,6 +226,12 @@ class ImageProcessingApp:
         self._update_job: str | None = None
         self.current_path: Path | None = None
         self.current_file_type: str | None = None
+        self.root_sources: list[Path] = []
+        self.file_list: list[Path] = []
+        self.current_index: int = -1
+        self._file_tree_iids: dict[int, str] = {}
+        self.index_var = tk.StringVar(value="")
+        self.resize_method_var = tk.StringVar(value=DEFAULT_RESIZE_METHOD)
         self.raw_settings: dict[str, object] = {
             "width": 1600,
             "height": 1300,
@@ -221,13 +255,24 @@ class ImageProcessingApp:
         self._original_canvas_offset_y = 0
         self._original_canvas_display_size = (0, 0)
         self._build_ui()
+        self._bind_shortcuts()
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill=tk.X)
 
-        ttk.Button(top, text="ファイルを開く", command=self.open_file).pack(side=tk.LEFT)
-        self.path_label = ttk.Label(top, text="ファイル未選択", width=70)
+        ttk.Button(top, text="ファイルを開く", command=self.open_files).pack(side=tk.LEFT)
+        ttk.Button(top, text="フォルダを開く", command=self.open_directory).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(top, text="追加", command=self.add_files).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(top, text="◀", width=3, command=self.show_prev).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="▶", width=3, command=self.show_next).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(top, text="番号").pack(side=tk.LEFT, padx=(8, 2))
+        index_entry = ttk.Entry(top, textvariable=self.index_var, width=6)
+        index_entry.pack(side=tk.LEFT)
+        index_entry.bind("<Return>", lambda _e: self.jump_to_index())
+        ttk.Button(top, text="移動", command=self.jump_to_index).pack(side=tk.LEFT, padx=(2, 0))
+
+        self.path_label = ttk.Label(top, text="ファイル未選択")
         self.path_label.pack(side=tk.LEFT, padx=(12, 0))
         self.reload_button = ttk.Button(top, text="RAW再読み込み", command=self.reload_raw, state=tk.DISABLED)
         self.reload_button.pack(side=tk.RIGHT, padx=(8, 0))
@@ -266,14 +311,46 @@ class ImageProcessingApp:
         main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
+        file_panel = ttk.Frame(main, padding=4, width=260)
+        main.add(file_panel, weight=0)
+
         controls = ttk.Frame(main, padding=8, width=320)
         main.add(controls, weight=0)
 
         preview = ttk.Frame(main, padding=8)
         main.add(preview, weight=1)
 
+        self._build_file_panel(file_panel)
         self._build_controls(controls)
         self._build_preview(preview)
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Left>", lambda _e: self.show_prev())
+        self.root.bind("<Right>", lambda _e: self.show_next())
+        self.root.bind("<Control-o>", lambda _e: self.open_files())
+        self.root.bind("<Control-O>", lambda _e: self.open_directory())
+
+    def _build_file_panel(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="ファイル一覧", font=("", 10, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            parent,
+            text="D0001=フォルダ(青)  0001=ファイル(緑)",
+            foreground="#555555",
+            font=("", 8),
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        self.file_tree = ttk.Treeview(list_frame, show="tree", selectmode="browse")
+        scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_tree.yview)
+        self.file_tree.configure(yscrollcommand=scroll.set)
+        self.file_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_tree.tag_configure("dir", foreground="#1565c0")
+        self.file_tree.tag_configure("file", foreground="#2e7d32")
+        self.file_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.file_tree.bind("<Double-1>", self._on_tree_activate)
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         preprocess = ttk.LabelFrame(parent, text="前処理", padding=6)
@@ -336,6 +413,20 @@ class ImageProcessingApp:
             foreground="#555555",
         ).pack(anchor=tk.W, pady=(2, 2))
         self._add_param_scale_row(preprocess, "resize", "リサイズ", 1, 10, 10)
+
+        method_row = ttk.Frame(preprocess)
+        method_row.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(method_row, text="手法", width=12).pack(side=tk.LEFT)
+        method_combo = ttk.Combobox(
+            method_row,
+            textvariable=self.resize_method_var,
+            values=list(RESIZE_METHODS.keys()),
+            state="readonly",
+            width=22,
+        )
+        method_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        method_combo.bind("<<ComboboxSelected>>", lambda _e: self.schedule_update())
+
         ttk.Label(
             preprocess,
             text="YOLO 検出 bbox の拡大倍率 (1.0 = 原寸)",
@@ -466,24 +557,169 @@ class ImageProcessingApp:
         if update_preview:
             self.schedule_update()
 
-    def open_file(self) -> None:
-        path = filedialog.askopenfilename(
+    def open_files(self) -> None:
+        paths = filedialog.askopenfilenames(
             title="画像ファイルを選択",
-            filetypes=[
-                ("対応形式", "*.npy *.raw *.png *.jpg *.jpeg"),
-                ("NumPy配列", "*.npy"),
-                ("RAW画像", "*.raw"),
-                ("PNG画像", "*.png"),
-                ("JPEG画像", "*.jpg *.jpeg"),
-                ("すべてのファイル", "*.*"),
-            ],
+            filetypes=FILE_DIALOG_TYPES,
         )
+        if not paths:
+            return
+        self._load_paths([Path(p) for p in paths])
+
+    def open_directory(self) -> None:
+        path = filedialog.askdirectory(title="フォルダを選択")
         if not path:
             return
+        root = Path(path)
+        if not directory_has_images(root):
+            messagebox.showwarning("フォルダ", "対応形式の画像が見つかりませんでした。")
+            return
+        self._load_paths([root])
 
-        file_path = Path(path)
+    def add_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="追加する画像ファイルを選択",
+            filetypes=FILE_DIALOG_TYPES,
+        )
+        if not paths:
+            return
+        new_paths = [Path(p) for p in paths if is_supported_image(Path(p))]
+        if not new_paths:
+            return
+        for p in new_paths:
+            if p not in self.root_sources:
+                self.root_sources.append(p)
+        self._rebuild_file_tree(preserve_path=self.current_path)
+        if self.current_index < 0 and self.file_list:
+            self.show_index(0)
+
+    def _load_paths(self, paths: list[Path]) -> None:
+        valid = [
+            p
+            for p in paths
+            if p.exists()
+            and ((p.is_file() and is_supported_image(p)) or (p.is_dir() and directory_has_images(p)))
+        ]
+        if not valid:
+            messagebox.showwarning("読み込み", "有効なパスがありません。")
+            return
+        self.root_sources = valid
+        self._rebuild_file_tree()
+        if self.file_list:
+            self.show_index(0)
+
+    def _rebuild_file_tree(self, *, preserve_path: Path | None = None) -> None:
+        self.file_list = []
+        self._file_tree_iids = {}
+        self.file_tree.delete(*self.file_tree.get_children(""))
+
+        dir_counter = [0]
+        for root in self.root_sources:
+            if root.is_file() and is_supported_image(root):
+                self._insert_file_node("", root)
+            elif root.is_dir():
+                node = build_dir_node(root)
+                if node is not None:
+                    self._insert_dir_node("", node, dir_counter)
+
+        if preserve_path is not None and preserve_path in self.file_list:
+            self.show_index(self.file_list.index(preserve_path), from_tree=True)
+        elif self.current_index >= len(self.file_list):
+            if self.file_list:
+                self.show_index(len(self.file_list) - 1, from_tree=True)
+            else:
+                self.current_index = -1
+                self.index_var.set("")
+
+    def _insert_dir_node(self, parent: str, node: DirNode, dir_counter: list[int]) -> str:
+        dir_counter[0] += 1
+        label = f"{format_dir_number(dir_counter[0])}  {node.path.name}/"
+        iid = self.file_tree.insert(parent, tk.END, text=label, tags=("dir",), open=True)
+        for file_path in node.files:
+            self._insert_file_node(iid, file_path)
+        for child in node.children:
+            self._insert_dir_node(iid, child, dir_counter)
+        return iid
+
+    def _insert_file_node(self, parent: str, path: Path) -> str:
+        file_index = len(self.file_list)
+        self.file_list.append(path)
+        label = f"{format_file_number(file_index)}  {path.name}"
+        iid = self.file_tree.insert(parent, tk.END, text=label, tags=("file",), values=(str(file_index),))
+        self._file_tree_iids[file_index] = iid
+        return iid
+
+    def _file_index_from_iid(self, iid: str) -> int | None:
+        if not iid:
+            return None
+        tags = self.file_tree.item(iid, "tags")
+        if "file" not in tags:
+            return None
+        values = self.file_tree.item(iid, "values")
+        if not values:
+            return None
+        return int(values[0])
+
+    def _on_tree_select(self, _event: tk.Event) -> None:
+        iid = self.file_tree.focus()
+        index = self._file_index_from_iid(iid) if iid else None
+        if index is not None:
+            self.show_index(index, from_tree=True)
+
+    def _on_tree_activate(self, _event: tk.Event) -> None:
+        iid = self.file_tree.focus()
+        index = self._file_index_from_iid(iid) if iid else None
+        if index is not None:
+            self.show_index(index)
+
+    def show_prev(self) -> None:
+        if not self.file_list:
+            return
+        if self.current_index <= 0:
+            self.show_index(len(self.file_list) - 1)
+        else:
+            self.show_index(self.current_index - 1)
+
+    def show_next(self) -> None:
+        if not self.file_list:
+            return
+        if self.current_index >= len(self.file_list) - 1:
+            self.show_index(0)
+        else:
+            self.show_index(self.current_index + 1)
+
+    def jump_to_index(self) -> None:
+        if not self.file_list:
+            return
+        text = self.index_var.get().strip()
+        if not text.isdigit():
+            messagebox.showwarning("番号", "番号には整数を入力してください。")
+            return
+        number = int(text)
+        if number < 1 or number > len(self.file_list):
+            messagebox.showwarning(
+                "番号",
+                f"1〜{format_file_number(len(self.file_list) - 1)} の番号を入力してください。",
+            )
+            return
+        self.show_index(number - 1)
+
+    def show_index(self, index: int, *, from_tree: bool = False) -> None:
+        if not self.file_list or index < 0 or index >= len(self.file_list):
+            return
+        self.current_index = index
+        path = self.file_list[index]
+        self.index_var.set(format_file_number(index))
+        if not from_tree:
+            iid = self._file_tree_iids.get(index)
+            if iid:
+                self.file_tree.selection_set(iid)
+                self.file_tree.focus(iid)
+                self.file_tree.see(iid)
+        self._load_image_path(path)
+
+    def _load_image_path(self, file_path: Path) -> None:
         suffix = file_path.suffix.lower()
-
         try:
             if suffix == ".npy":
                 array = self.load_npy(file_path)
@@ -498,7 +734,7 @@ class ImageProcessingApp:
                 array, image = self.load_raster(file_path)
                 self.current_file_type = "jpeg"
                 self.reload_button.config(state=tk.DISABLED)
-            else:
+            elif suffix == ".raw":
                 settings = self._ask_raw_settings(file_path)
                 if settings is None:
                     return
@@ -507,6 +743,9 @@ class ImageProcessingApp:
                 image = self.array_to_image(array)
                 self.current_file_type = "raw"
                 self.reload_button.config(state=tk.NORMAL)
+            else:
+                messagebox.showerror("読み込みエラー", f"未対応の形式です: {suffix}")
+                return
         except Exception as exc:
             messagebox.showerror("読み込みエラー", f"ファイルを読み込めませんでした。\n{exc}")
             return
@@ -676,6 +915,7 @@ class ImageProcessingApp:
         }
         for key, value in defaults.items():
             self._set_param(key, value)
+        self.resize_method_var.set(DEFAULT_RESIZE_METHOD)
 
         if update_preview:
             self.update_preview()
@@ -990,6 +1230,10 @@ class ImageProcessingApp:
     def _get_resize_scale(self) -> float:
         return self.params["resize"].get() / 10.0
 
+    def _get_resize_resampling(self) -> Image.Resampling:
+        name = self.resize_method_var.get()
+        return RESIZE_METHODS.get(name, RESIZE_METHODS[DEFAULT_RESIZE_METHOD])
+
     def _scale_image(self, image: Image.Image) -> Image.Image:
         scale = self._get_resize_scale()
         if scale >= 0.999:
@@ -998,7 +1242,7 @@ class ImageProcessingApp:
         new_h = max(1, int(round(image.height * scale)))
         if new_w == image.width and new_h == image.height:
             return image.copy()
-        return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        return image.resize((new_w, new_h), self._get_resize_resampling())
 
     def _get_working_image(self) -> Image.Image | None:
         """トリミング適用済みならその画像、未適用なら元画像を返す。"""

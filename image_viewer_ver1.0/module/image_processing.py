@@ -5,6 +5,16 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
+RESIZE_METHODS: dict[str, Image.Resampling] = {
+    "NEAREST（最近傍）": Image.Resampling.NEAREST,
+    "BILINEAR（双線形）": Image.Resampling.BILINEAR,
+    "BICUBIC（双三次）": Image.Resampling.BICUBIC,
+    "LANCZOS（高品質）": Image.Resampling.LANCZOS,
+    "BOX（ボックス平均）": Image.Resampling.BOX,
+    "HAMMING（Hamming窓）": Image.Resampling.HAMMING,
+}
+DEFAULT_RESIZE_METHOD = "LANCZOS（高品質）"
+
 
 def default_params() -> dict[str, int]:
     return {
@@ -23,12 +33,18 @@ def default_params() -> dict[str, int]:
     }
 
 
-def apply_processing(image: Image.Image, params: dict[str, int]) -> Image.Image:
+def apply_processing(
+    image: Image.Image,
+    params: dict[str, int],
+    *,
+    resize_method: Image.Resampling | None = None,
+) -> Image.Image:
     resize = params.get("resize", 10) / 10.0
     if resize < 0.999:
         new_w = max(1, int(round(image.width * resize)))
         new_h = max(1, int(round(image.height * resize)))
-        result = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        resampling = resize_method if resize_method is not None else RESIZE_METHODS[DEFAULT_RESIZE_METHOD]
+        result = image.resize((new_w, new_h), resampling)
     else:
         result = image.copy()
 

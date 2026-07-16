@@ -31,7 +31,12 @@ from module.image_loader import (  # noqa: E402
     is_supported_image,
     load_image_file,
 )
-from module.image_processing import apply_processing, default_params  # noqa: E402
+from module.image_processing import (  # noqa: E402
+    DEFAULT_RESIZE_METHOD,
+    RESIZE_METHODS,
+    apply_processing,
+    default_params,
+)
 
 
 def default_downloads_dir() -> Path:
@@ -193,8 +198,8 @@ class ZoomableCanvas(ttk.Frame):
         self.on_click = on_click
 
         self.canvas = tk.Canvas(self, background="#1e1e1e", highlightthickness=0)
-        h_scroll = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        v_scroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        h_scroll = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self._on_hscroll)
+        v_scroll = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self._on_vscroll)
         self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
 
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -207,6 +212,7 @@ class ZoomableCanvas(ttk.Frame):
         self._source_array: np.ndarray | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._zoom = 1.0
+        self._resampling: Image.Resampling = Image.Resampling.LANCZOS
         self._pan_start: tuple[int, int] | None = None
         self._pan_remainder_x = 0.0
         self._pan_remainder_y = 0.0
@@ -242,6 +248,19 @@ class ZoomableCanvas(ttk.Frame):
     def get_zoom(self) -> float:
         return self._zoom
 
+    def set_resampling(self, resampling: Image.Resampling) -> None:
+        if resampling != self._resampling:
+            self._resampling = resampling
+            self._redraw()
+
+    def _on_hscroll(self, *args: str) -> None:
+        self.canvas.xview(*args)
+        self._redraw()
+
+    def _on_vscroll(self, *args: str) -> None:
+        self.canvas.yview(*args)
+        self._redraw()
+
     def fit_to_window(self) -> None:
         if self._image is None:
             return
@@ -253,6 +272,7 @@ class ZoomableCanvas(ttk.Frame):
         self._redraw()
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
+        self._redraw()
 
     def actual_size(self) -> None:
         self._zoom = 1.0
@@ -308,23 +328,66 @@ class ZoomableCanvas(ttk.Frame):
                 fill="#aaaaaa",
                 font=("", 12),
             )
+            self.canvas.config(scrollregion=(0, 0, 1, 1))
             return
 
-        disp_w = max(1, int(round(self._image.width * self._zoom)))
-        disp_h = max(1, int(round(self._image.height * self._zoom)))
-        disp = self._image if self._zoom >= 0.999 else self._image.resize((disp_w, disp_h), Image.Resampling.NEAREST)
-        self._photo = ImageTk.PhotoImage(disp)
-        self.canvas.create_image(0, 0, image=self._photo, anchor=tk.NW)
+        zoom = self._zoom
+        img_w, img_h = self._image.width, self._image.height
+        disp_w = max(1, int(round(img_w * zoom)))
+        disp_h = max(1, int(round(img_h * zoom)))
         self.canvas.config(scrollregion=(0, 0, disp_w, disp_h))
+
+        # 表示中の領域（ズーム後座標）だけを描画してメモリ消費を抑える。
+        view_w = max(1, self.canvas.winfo_width())
+        view_h = max(1, self.canvas.winfo_height())
+        left = max(0.0, self.canvas.canvasx(0))
+        top = max(0.0, self.canvas.canvasy(0))
+        right = min(float(disp_w), left + view_w)
+        bottom = min(float(disp_h), top + view_h)
+        if right <= left or bottom <= top:
+            return
+
+        # ズーム後座標 → 元画像座標へ変換し、可視範囲を切り出す。
+        src_left = max(0, min(img_w - 1, int(left / zoom)))
+        src_top = max(0, min(img_h - 1, int(top / zoom)))
+        src_right = max(src_left + 1, min(img_w, int(right / zoom) + 1))
+        src_bottom = max(src_top + 1, min(img_h, int(bottom / zoom) + 1))
+
+        region = self._image.crop((src_left, src_top, src_right, src_bottom))
+        region_w = max(1, int(round((src_right - src_left) * zoom)))
+        region_h = max(1, int(round((src_bottom - src_top) * zoom)))
+        if (region.width, region.height) != (region_w, region_h):
+            region = region.resize((region_w, region_h), self._resampling)
+
+        self._photo = ImageTk.PhotoImage(region)
+        self.canvas.create_image(
+            int(round(src_left * zoom)),
+            int(round(src_top * zoom)),
+            image=self._photo,
+            anchor=tk.NW,
+        )
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         if self._image is None:
             return
         factor = 1.15 if event.delta > 0 else 1 / 1.15
         old_zoom = self._zoom
-        self._zoom = max(0.05, min(32.0, self._zoom * factor))
-        if abs(self._zoom - old_zoom) < 1e-6:
+        new_zoom = max(0.05, min(32.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
             return
+
+        # カーソル下の画像座標がズーム後も同じ位置に留まるようにする。
+        img_x = self.canvas.canvasx(event.x) / old_zoom
+        img_y = self.canvas.canvasy(event.y) / old_zoom
+        self._zoom = new_zoom
+
+        disp_w = max(1, int(round(self._image.width * new_zoom)))
+        disp_h = max(1, int(round(self._image.height * new_zoom)))
+        self.canvas.config(scrollregion=(0, 0, disp_w, disp_h))
+        new_left = img_x * new_zoom - event.x
+        new_top = img_y * new_zoom - event.y
+        self.canvas.xview_moveto(max(0.0, new_left / disp_w))
+        self.canvas.yview_moveto(max(0.0, new_top / disp_h))
         self._redraw()
 
     def _on_pan_start(self, event: tk.Event) -> None:
@@ -350,6 +413,8 @@ class ZoomableCanvas(ttk.Frame):
             self.canvas.xview_scroll(scroll_x, "units")
         if scroll_y:
             self.canvas.yview_scroll(scroll_y, "units")
+        if scroll_x or scroll_y:
+            self._redraw()
 
     def _on_pan_end(self, _event: tk.Event) -> None:
         self._pan_start = None
@@ -404,6 +469,7 @@ class ImageViewerApp:
         self.param_values = default_params()
         self.param_vars: dict[str, tk.IntVar] = {}
         self.param_labels: dict[str, ttk.Label] = {}
+        self.resize_method_var = tk.StringVar(value=DEFAULT_RESIZE_METHOD)
         self._update_job: str | None = None
 
         self.magnifier_enabled = tk.BooleanVar(value=True)
@@ -615,6 +681,8 @@ class ImageViewerApp:
         ]
         for key, label, vmin, vmax, default in slider_defs:
             self._add_slider(inner, key, label, vmin, vmax, default)
+            if key == "resize":
+                self._add_resize_method_row(inner)
 
         mag_frame = ttk.LabelFrame(parent, text="ルーペ", padding=6)
         mag_frame.pack(fill=tk.X, pady=(8, 0))
@@ -707,6 +775,24 @@ class ImageViewerApp:
 
         scale = ttk.Scale(row, from_=vmin, to=vmax, orient=tk.HORIZONTAL, variable=var, command=on_change)
         scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+
+    def _add_resize_method_row(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(row, text="手法", width=12).pack(side=tk.LEFT)
+        combo = ttk.Combobox(
+            row,
+            textvariable=self.resize_method_var,
+            values=list(RESIZE_METHODS.keys()),
+            state="readonly",
+            width=22,
+        )
+        combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        combo.bind("<<ComboboxSelected>>", lambda _e: self.schedule_refresh())
+
+    def _get_resize_resampling(self) -> Image.Resampling:
+        name = self.resize_method_var.get()
+        return RESIZE_METHODS.get(name, RESIZE_METHODS[DEFAULT_RESIZE_METHOD])
 
     @staticmethod
     def _format_param_value(key: str, value: int) -> str:
@@ -991,13 +1077,18 @@ class ImageViewerApp:
     def _get_processed_image(self) -> Image.Image | None:
         if self.base_image is None:
             return None
-        return apply_processing(self.base_image, self.param_values)
+        return apply_processing(
+            self.base_image,
+            self.param_values,
+            resize_method=self._get_resize_resampling(),
+        )
 
     def refresh_view(self) -> None:
         processed = self._get_processed_image()
         if processed is None:
             self.main_canvas.set_image(None)
             return
+        self.main_canvas.set_resampling(self._get_resize_resampling())
         self.main_canvas.set_image(processed, self.source_array)
 
     def reset_params(self) -> None:
@@ -1007,6 +1098,7 @@ class ImageViewerApp:
             if key in self.param_vars:
                 self.param_vars[key].set(value)
                 self.param_labels[key].config(text=self._format_param_value(key, value))
+        self.resize_method_var.set(DEFAULT_RESIZE_METHOD)
         self.refresh_view()
 
     def flip_horizontal(self) -> None:
