@@ -1,0 +1,14 @@
+# 共通ライブラリ / image_studio（ビューワー・解析）に必要
+numpy>=1.24
+Pillow>=10.0
+
+# param_affine_tool（顔特徴点・アフィン変換）を使う場合は、上記に加えて以下も必要です。
+# モデルファイル（module/shape_predictor_68_face_landmarks.dat, module/yolov8n-face-lindevs.pt）も同梱しています。
+# opencv-python
+# torch
+# torchvision
+# face-alignment
+# scikit-image
+# scipy
+# dlib
+# ultralytics
