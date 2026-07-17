@@ -128,13 +128,99 @@ def compute_stats(array: np.ndarray, mask: np.ndarray | None = None) -> dict[str
     }
 
 
+def _aligned_int_edges(
+    values: np.ndarray,
+    lo: float,
+    hi: float,
+    max_bins: int = 65536,
+) -> np.ndarray | None:
+    """画素値を整数とみなし、min〜max を 1 階調ずつ数えるためのビン境界を作る。
+
+    bins で機械的に分割すると、階調数より分割数が多いとき空ビンが規則的に挟まり
+    くし状（ギザギザ）になる。ここでは値を整数へ丸め、各整数値が 1 ビンに入るよう
+    境界を整数グリッドに整列させる。飛び飛び（例: 偶数のみ）のデータでも、その
+    量子化ステップに合わせるので空ビンが挟まらない。
+    階調が多すぎる場合のみ None を返し、通常の等間隔ビンにフォールバックする。
+    """
+    # 画素値は整数。小数（グレー変換等）を丸めてから階調を評価する。
+    rounded = np.rint(values)
+    lo_i = float(np.floor(lo))
+    hi_i = float(np.ceil(hi))
+    in_range = rounded[(rounded >= lo_i) & (rounded <= hi_i)]
+    if in_range.size == 0:
+        return None
+    vals, counts = np.unique(in_range, return_counts=True)
+    if vals.size < 2:
+        return None
+
+    # 量子化ステップは「主要な階調の最頻間隔」で推定する。
+    # 最小間隔を使うと、補間端などで稀に現れる中間値が1つあるだけで step=1 となり、
+    # 実際は飛び飛び（例: 偶数のみ）の値でも空・低ビンが規則的に挟まりくし状になる。
+    # 頻度が最大の一定割合以上の階調だけを見て、その最頻間隔を採用する。
+    threshold = counts.max() * 0.10
+    major = vals[counts >= threshold]
+    ref = major if major.size >= 2 else vals
+    diffs = np.diff(ref)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+    gap_vals, gap_counts = np.unique(diffs, return_counts=True)
+    step = float(gap_vals[int(np.argmax(gap_counts))])
+    if step <= 0:
+        step = 1.0
+    levels = int(round((hi_i - lo_i) / step)) + 1
+    if levels < 2 or levels > max_bins:
+        return None
+    # 各整数階調をビン中心に置くよう半ステップずらした整数グリッド。
+    return (lo_i - step / 2.0) + step * np.arange(levels + 1)
+
+
+def _histogram_1d(
+    values: np.ndarray,
+    bins: int,
+    value_range: tuple[float, float] | None,
+    auto_bins: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """1次元データからヒストグラム（counts, edges）を作る。value_range 指定時はその範囲のみ集計。"""
+    values = values[np.isfinite(values)]
+    if value_range is not None:
+        lo, hi = value_range
+        if hi < lo:
+            lo, hi = hi, lo
+        values = values[(values >= lo) & (values <= hi)]
+    elif values.size:
+        lo, hi = float(values.min()), float(values.max())
+    else:
+        lo, hi = 0.0, 1.0
+
+    if values.size == 0:
+        return np.zeros(bins, dtype=np.float64), np.linspace(lo, hi, bins + 1)
+    if hi <= lo:
+        hi = lo + 1e-6
+
+    edges: np.ndarray | None = None
+    if auto_bins:
+        edges = _aligned_int_edges(values, lo, hi)
+    if edges is not None:
+        counts, out_edges = np.histogram(values, bins=edges)
+    else:
+        counts, out_edges = np.histogram(values, bins=bins, range=(lo, hi))
+    return counts.astype(np.float64), out_edges
+
+
 def compute_histogram(
     array: np.ndarray,
     bins: int = 256,
     mask: np.ndarray | None = None,
     channel: str = "gray",
+    value_range: tuple[float, float] | None = None,
+    auto_bins: bool = False,
 ) -> dict[str, Any]:
-    """ヒストグラムと累積分布を算出する。"""
+    """ヒストグラムと累積分布を算出する。
+
+    value_range を指定するとその値域のみ集計する。auto_bins=True のときは、
+    量子化された整数階調に境界を合わせてくし状アーティファクトを抑える。
+    """
     arr = np.asarray(array)
     if channel == "gray" or arr.ndim == 2:
         data = to_float_gray(arr)
@@ -142,13 +228,7 @@ def compute_histogram(
             values = data[mask.astype(bool)].ravel()
         else:
             values = data.ravel()
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            edges = np.linspace(0, 1, bins + 1)
-            counts = np.zeros(bins, dtype=np.float64)
-        else:
-            counts, edges = np.histogram(values, bins=bins)
-            counts = counts.astype(np.float64)
+        counts, edges = _histogram_1d(values, bins, value_range, auto_bins)
         cdf = np.cumsum(counts)
         if cdf[-1] > 0:
             cdf = cdf / cdf[-1]
@@ -156,7 +236,9 @@ def compute_histogram(
 
     # RGB 各チャンネル
     if arr.ndim != 3 or arr.shape[-1] < 3:
-        return compute_histogram(arr, bins=bins, mask=mask, channel="gray")
+        return compute_histogram(
+            arr, bins=bins, mask=mask, channel="gray", value_range=value_range, auto_bins=auto_bins
+        )
 
     result: dict[str, Any] = {"channel": "rgb", "channels": {}}
     names = ("R", "G", "B")
@@ -166,13 +248,7 @@ def compute_histogram(
             values = ch[mask.astype(bool)].ravel()
         else:
             values = ch.ravel()
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            edges = np.linspace(0, 1, bins + 1)
-            counts = np.zeros(bins, dtype=np.float64)
-        else:
-            counts, edges = np.histogram(values, bins=bins)
-            counts = counts.astype(np.float64)
+        counts, edges = _histogram_1d(values, bins, value_range, auto_bins)
         cdf = np.cumsum(counts)
         if cdf[-1] > 0:
             cdf = cdf / cdf[-1]

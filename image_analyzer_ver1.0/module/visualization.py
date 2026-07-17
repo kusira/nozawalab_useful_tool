@@ -134,21 +134,32 @@ def array_to_display_image(array: np.ndarray, cmap: str | None = None) -> Image.
     return apply_colormap(arr, cmap="gray")
 
 
+def _fmt_axis_num(v: float) -> str:
+    """軸ラベル用の数値整形。画素値・カウントは整数なので小数は使わない。"""
+    v = round(float(v))
+    if v == 0:
+        return "0"
+    if abs(v) >= 100000:
+        return f"{v:.1e}"
+    return f"{int(v)}"
+
+
 def render_histogram_image(
     hist: dict[str, Any],
-    width: int = 420,
-    height: int = 220,
+    width: int = 460,
+    height: int = 260,
     show_cdf: bool = True,
 ) -> Image.Image:
-    """ヒストグラムを PIL 画像として描画する。"""
+    """ヒストグラムを PIL 画像として描画する（value / count 軸に目盛り付き）。"""
     img = Image.new("RGB", (width, height), (30, 30, 30))
     draw = ImageDraw.Draw(img)
-    margin_l, margin_r, margin_t, margin_b = 36, 12, 12, 28
+    margin_l, margin_r, margin_t, margin_b = 52, 42, 16, 40
     plot_w = width - margin_l - margin_r
     plot_h = height - margin_t - margin_b
+    y_bottom = margin_t + plot_h
 
     draw.rectangle(
-        [margin_l, margin_t, margin_l + plot_w, margin_t + plot_h],
+        [margin_l, margin_t, margin_l + plot_w, y_bottom],
         outline=(80, 80, 80),
         fill=(20, 20, 20),
     )
@@ -159,10 +170,14 @@ def render_histogram_image(
         for name, color in colors.items():
             series.append((hist["channels"][name]["counts"], color))
         cdf_src = hist["channels"]["R"]["cdf"]
+        edges = np.asarray(hist["channels"]["R"]["edges"], dtype=np.float64)
     else:
         series.append((hist["counts"], (200, 200, 200)))
         cdf_src = hist["cdf"]
+        edges = np.asarray(hist["edges"], dtype=np.float64)
 
+    vmin = float(edges[0]) if edges.size else 0.0
+    vmax = float(edges[-1]) if edges.size else 1.0
     max_count = max((float(s.max()) if s.size else 0.0) for s, _ in series) or 1.0
 
     for counts, color in series:
@@ -173,23 +188,61 @@ def render_histogram_image(
         for i, c in enumerate(counts):
             h = (float(c) / max_count) * plot_h
             x0 = margin_l + i * bar_w
-            y0 = margin_t + plot_h - h
-            draw.rectangle([x0, y0, x0 + bar_w, margin_t + plot_h], fill=color)
+            y0 = y_bottom - h
+            draw.rectangle([x0, y0, x0 + bar_w, y_bottom], fill=color)
 
     if show_cdf and cdf_src is not None and len(cdf_src) > 1:
         pts = []
         n = len(cdf_src)
         for i, v in enumerate(cdf_src):
             x = margin_l + (i / max(n - 1, 1)) * plot_w
-            y = margin_t + plot_h - float(v) * plot_h
+            y = y_bottom - float(v) * plot_h
             pts.append((x, y))
         if len(pts) >= 2:
             draw.line(pts, fill=(255, 200, 60), width=2)
 
-    draw.text((4, margin_t), "count", fill=(160, 160, 160))
-    draw.text((width // 2 - 20, height - 18), "value", fill=(160, 160, 160))
+    tick_col = (150, 150, 150)
+    grid_col = (55, 55, 55)
+
+    # value（横）軸の目盛り
+    x_ticks = 5
+    for k in range(x_ticks + 1):
+        frac = k / x_ticks
+        x = margin_l + frac * plot_w
+        val = vmin + (vmax - vmin) * frac
+        draw.line([(x, y_bottom), (x, y_bottom + 4)], fill=tick_col)
+        if 0 < k < x_ticks:
+            draw.line([(x, margin_t), (x, y_bottom)], fill=grid_col)
+        label = _fmt_axis_num(val)
+        tw = draw.textlength(label)
+        draw.text((x - tw / 2, y_bottom + 6), label, fill=tick_col)
+
+    # count（縦）軸の目盛り
+    y_ticks = 4
+    for k in range(y_ticks + 1):
+        frac = k / y_ticks
+        y = y_bottom - frac * plot_h
+        cval = max_count * frac
+        draw.line([(margin_l - 4, y), (margin_l, y)], fill=tick_col)
+        if 0 < k < y_ticks:
+            draw.line([(margin_l, y), (margin_l + plot_w, y)], fill=grid_col)
+        label = _fmt_axis_num(cval)
+        tw = draw.textlength(label)
+        draw.text((margin_l - 6 - tw, y - 5), label, fill=tick_col)
+
+    # CDF（右）軸の目盛り（0〜100%）
     if show_cdf:
-        draw.text((width - 70, 4), "CDF", fill=(255, 200, 60))
+        for k in range(y_ticks + 1):
+            frac = k / y_ticks
+            y = y_bottom - frac * plot_h
+            draw.line([(margin_l + plot_w, y), (margin_l + plot_w + 4, y)], fill=(150, 130, 70))
+            label = f"{int(frac * 100)}%"
+            draw.text((margin_l + plot_w + 6, y - 5), label, fill=(200, 170, 90))
+
+    draw.text((4, 2), "count", fill=(160, 160, 160))
+    draw.text((width // 2 - 14, height - 14), "value", fill=(160, 160, 160))
+    if show_cdf:
+        draw.text((width - 60, 2), "CDF", fill=(255, 200, 60))
     return img
 
 
