@@ -1,3 +1,6 @@
+作成者: 山口高璃
+github: [http://github.com/kusira/nozawalab_useful_tool/tree/main/image_analyzer_tools_ver1.0](http://github.com/kusira/nozawalab_useful_tool/tree/main/image_analyzer_tools_ver1.0)
+
 # image_analyzer_tools
 
 野沢研の画像ツールをまとめたスイートです。共通ライブラリ（`common/`）を土台に、
